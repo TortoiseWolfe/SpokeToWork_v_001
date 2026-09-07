@@ -1,6 +1,26 @@
 name: Supabase Keep-Alive
 
 # Keeps the Supabase Cloud free-tier project awake (it auto-pauses after 7 days idle).
+#
+# READ THIS BEFORE TRUSTING A RED RUN.
+#
+# A keep-alive can PREVENT an idle pause. It can never REVERSE one. Once the
+# project goes INACTIVE every subsequent run is guaranteed to fail, and every
+# failure looks identical to the last — so the workflow degrades into a red
+# light that carries no information. That is what happened between 2026-08-19
+# and 2026-09-07: eight consecutive identical failures, none of them read.
+#
+# Worse, idleness was not even the cause. The 2026-08-19 failure came back in
+# 100ms with "TypeError: fetch failed" — that is DNS returning NXDOMAIN for a
+# paused project, not a slow wake-up (a real wake-up takes 10-30 SECONDS). And
+# it was only 3 days after a green run, well inside the 7-day idle window.
+#
+# The actual cause was the free-tier ceiling: 2 ACTIVE projects per USER,
+# counted across every org where that user is Owner or Administrator. A third
+# project was created on 2026-08-07, and Supabase paused this one to get back
+# under the limit. No cron schedule can prevent that, which is precisely why
+# the classification step below exists — the job is to say WHICH failure this
+# is, not to retry harder.
 on:
   schedule:
     # 3:00 AM UTC every 3rd day of the month.
@@ -21,6 +41,85 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
+
+      # Runs BEFORE the toolchain, because it needs no toolchain. If the
+      # project is paused, this fails in seconds with a message that names the
+      # cause, rather than after two minutes of pnpm install followed by
+      # generic troubleshooting advice that sent three sessions looking at
+      # credentials and network.
+      #
+      # Resolution goes through Cloudflare DoH rather than the runner's
+      # resolver so a negative cache on the runner cannot mask a project that
+      # has genuinely come back.
+      - name: Classify backend reachability
+        id: reach
+        env:
+          SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.NEXT_PUBLIC_SUPABASE_ANON_KEY }}
+        run: |
+          set -uo pipefail
+
+          if [ -z "${SUPABASE_URL:-}" ] || [ -z "${SUPABASE_ANON_KEY:-}" ]; then
+            echo "verdict=missing-secrets" >> "$GITHUB_OUTPUT"
+            echo "::error::NEXT_PUBLIC_SUPABASE_URL / _ANON_KEY are empty."
+            echo "Settings -> Secrets and variables -> Actions. Note an absent"
+            echo "secret arrives as an empty string, it does not fail loudly."
+            exit 1
+          fi
+
+          HOST=$(printf '%s' "$SUPABASE_URL" | sed -E 's#^https?://##; s#/.*$##')
+          echo "host: ${HOST}"
+
+          DNS=$(curl -sS --max-time 20 -H 'accept: application/dns-json' \
+            "https://cloudflare-dns.com/dns-query?name=${HOST}&type=A" || echo '{}')
+          RCODE=$(printf '%s' "$DNS" | node -pe \
+            "try{String(JSON.parse(require('fs').readFileSync(0)).Status)}catch(e){'x'}")
+          ADDRS=$(printf '%s' "$DNS" | node -pe \
+            "try{(JSON.parse(require('fs').readFileSync(0)).Answer||[]).filter(a=>a.type===1).map(a=>a.data).join(',')}catch(e){''}")
+
+          # RCODE 3 is NXDOMAIN. Supabase withdraws the DNS record of a paused
+          # project entirely, so this is an unambiguous "not running" — it does
+          # not overlap with a slow start, a bad key, or a network blip.
+          if [ "$RCODE" = "3" ] || [ -z "$ADDRS" ]; then
+            echo "verdict=paused" >> "$GITHUB_OUTPUT"
+            {
+              echo "## Supabase project is PAUSED or DELETED"
+              echo ""
+              echo "\`${HOST}\` does not resolve (DoH rcode \`${RCODE}\`, no A records)."
+              echo ""
+              echo "**A keep-alive cannot fix this.** Restore it, then work out why it"
+              echo "paused — and check the free-tier ceiling before assuming idleness:"
+              echo "2 active projects per USER across every org where that user is"
+              echo "Owner or Administrator. Creating a third pauses one of the others."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::${HOST} does not resolve — project paused or deleted. See job summary."
+            exit 1
+          fi
+
+          echo "resolves to: ${ADDRS}"
+
+          # A paused project never gets here, so any failure below is a live
+          # backend answering wrongly — a genuinely different problem.
+          CODE=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 45 \
+            "${SUPABASE_URL}/auth/v1/health" -H "apikey: ${SUPABASE_ANON_KEY}" || echo 000)
+          echo "auth/v1/health: ${CODE}"
+
+          case "$CODE" in
+            200)
+              echo "verdict=healthy" >> "$GITHUB_OUTPUT" ;;
+            401|403)
+              echo "verdict=bad-key" >> "$GITHUB_OUTPUT"
+              echo "::error::DNS resolves but /auth/v1/health returned ${CODE} — the anon key is wrong or rotated, the project is fine."
+              exit 1 ;;
+            000)
+              echo "verdict=unreachable" >> "$GITHUB_OUTPUT"
+              echo "::error::${HOST} resolves but did not answer within 45s. Runner network or a Supabase incident — NOT a pause."
+              exit 1 ;;
+            *)
+              echo "verdict=http-${CODE}" >> "$GITHUB_OUTPUT"
+              echo "::error::/auth/v1/health returned ${CODE}. Backend is up but unhealthy."
+              exit 1 ;;
+          esac
 
       # pnpm MUST be installed before setup-node: setup-node@v5 defaults to
       # package-manager-cache: true, which shells out to pnpm to resolve the
@@ -52,6 +151,12 @@ jobs:
       # fail from the project role (42501: must be owner) — the grant cannot be
       # closed from here. Detection is therefore the whole mitigation: if the
       # row count moves, someone has written to it.
+      #
+      # This tripwire has been DARK since 2026-08-16, because it sits after a
+      # step that could not pass while the project was paused. A detector that
+      # silently stops detecting is the worst outcome available, which is the
+      # other reason the classification step above runs first: it separates
+      # "the tripwire says nothing happened" from "the tripwire did not run".
       - name: Detect spatial_ref_sys tampering (#85)
         env:
           SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
@@ -84,12 +189,31 @@ jobs:
             exit 1
           fi
 
+      # Reads the verdict rather than guessing. The old version of this step
+      # printed the same four lines for a paused project, a wrong key, a runner
+      # network fault and a broken toolchain — which is how eight red runs in a
+      # row went unread.
       - name: Notify on failure
         if: failure()
+        env:
+          VERDICT: ${{ steps.reach.outputs.verdict }}
         run: |
-          echo "❌ Supabase priming failed!"
-          echo "Check WHICH step failed before assuming the instance is paused —"
-          echo "a setup/toolchain failure never reaches Supabase at all."
-          echo "If 'Prime Supabase instance' itself failed, then verify the"
-          echo "project is active and NEXT_PUBLIC_SUPABASE_URL/ANON_KEY are correct."
+          case "${VERDICT:-}" in
+            "")
+              echo "❌ Failed before the backend was ever classified."
+              echo "   A setup/toolchain failure, or the secrets step. This did NOT"
+              echo "   reach Supabase — do not go looking at the project." ;;
+            paused)
+              echo "❌ Project is PAUSED or DELETED (DNS does not resolve)."
+              echo "   Restore it, then find out WHY. Check the free-tier ceiling"
+              echo "   before assuming idleness — see the header of this file." ;;
+            healthy)
+              echo "❌ Backend is UP and the key is good, so this is a real defect."
+              echo "   Either 'pnpm run prime' failed against a live database, or"
+              echo "   the #85 tripwire fired. Read the failing step — those two"
+              echo "   mean very different things and neither is an outage." ;;
+            *)
+              echo "❌ Backend reachable, verdict: ${VERDICT}."
+              echo "   The classification step named the cause; scroll up to it." ;;
+          esac
           exit 1
